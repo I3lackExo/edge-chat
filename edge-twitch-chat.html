@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<title>Edge Twitch Chat (BTTV/FFZ/7TV)</title>
+<style>
+  :root{
+    --bg: #0e0e10;
+    --bg-msg-alt: rgba(255,255,255,0.03);
+    --text: #efeff1;
+    --muted: #8a8a8f;
+    --accent: #9147ff;
+    --font-size: 15px;
+    --emote-size: 22px;
+    --gap: 6px;
+  }
+  html,body{
+    margin:0; padding:0; height:100%; overflow:hidden;
+    background: var(--bg);
+    font-family: "Inter", "Segoe UI", -apple-system, sans-serif;
+    color: var(--text);
+  }
+  #status{
+    position:fixed; top:4px; right:6px;
+    font-size:10px; color:var(--muted);
+    z-index:10; opacity:0.6;
+  }
+  #chat{
+    height:100%;
+    display:flex;
+    flex-direction:column;
+    justify-content:flex-end;
+    overflow:hidden;
+    padding: 4px 8px;
+    box-sizing:border-box;
+  }
+  .msg{
+    display:flex;
+    flex-wrap:wrap;
+    align-items:center;
+    column-gap: 5px;
+    row-gap: 2px;
+    font-size: var(--font-size);
+    line-height: 1.35;
+    padding: 3px 6px;
+    border-radius: 4px;
+    animation: slidein 160ms ease-out;
+    word-break: break-word;
+  }
+  .msg:nth-child(odd){ background: var(--bg-msg-alt); }
+  @keyframes slidein{
+    from{ opacity:0; transform: translateY(4px); }
+    to{ opacity:1; transform: translateY(0); }
+  }
+  .badge{
+    height: 16px; width:16px; vertical-align:middle; border-radius:3px;
+  }
+  .user{
+    font-weight:700;
+    white-space:nowrap;
+  }
+  .colon{ color:var(--muted); margin-right:2px; }
+  .emote{
+    height: var(--emote-size);
+    vertical-align: middle;
+    display:inline-block;
+  }
+  .word{ display:inline; }
+</style>
+</head>
+<body>
+<div id="status">verbinde…</div>
+<div id="chat"></div>
+
+<script>
+/* ======================= KONFIGURATION ======================= */
+// Kanalname per URL-Parameter ?channel=NAME überschreibbar,
+// sonst hier den Standard-Kanal eintragen:
+const params = new URLSearchParams(location.search);
+const CHANNEL = (params.get('channel') || 'DEIN_KANALNAME').toLowerCase();
+const MAX_MESSAGES = 60;      // wie viele Nachrichten im Verlauf bleiben
+const SHOW_BADGES = true;     // Twitch-Badges anzeigen (Mod, Sub, etc.)
+/* =============================================================== */
+
+const chatEl = document.getElementById('chat');
+const statusEl = document.getElementById('status');
+
+let bttvEmotes = {};   // name -> url
+let ffzEmotes = {};
+let sevenTvEmotes = {};
+let badgeCache = {};   // "set/id" -> url (global + channel badges)
+
+function setStatus(t){ statusEl.textContent = t; }
+
+/* ---------- Emote-Sets laden (BTTV, FFZ, 7TV) ---------- */
+async function loadEmotes(){
+  try{
+    // Twitch-User-ID ermitteln (ohne eigenen API-Key, über IVR-Proxy)
+    let twitchId = null;
+    try{
+      const r = await fetch(`https://api.ivr.fi/v2/twitch/user?login=${CHANNEL}`);
+      const j = await r.json();
+      twitchId = j?.[0]?.id || null;
+    }catch(e){ console.warn('IVR lookup fehlgeschlagen', e); }
+
+    // BTTV global + channel
+    try{
+      const g = await (await fetch('https://api.betterttv.net/3/cached/emotes/global')).json();
+      g.forEach(e => bttvEmotes[e.code] = `https://cdn.betterttv.net/emote/${e.id}/2x`);
+    }catch(e){ console.warn('BTTV global fehlgeschlagen', e); }
+    if(twitchId){
+      try{
+        const c = await (await fetch(`https://api.betterttv.net/3/cached/users/twitch/${twitchId}`)).json();
+        (c.channelEmotes||[]).concat(c.sharedEmotes||[]).forEach(e=>{
+          bttvEmotes[e.code] = `https://cdn.betterttv.net/emote/${e.id}/2x`;
+        });
+      }catch(e){ console.warn('BTTV channel fehlgeschlagen', e); }
+    }
+
+    // FFZ global + channel (funktioniert direkt mit Channel-Namen)
+    try{
+      const g = await (await fetch('https://api.frankerfacez.com/v1/set/global')).json();
+      Object.values(g.sets).forEach(set=>{
+        set.emoticons.forEach(e=>{
+          const urls = e.urls;
+          ffzEmotes[e.name] = 'https:' + (urls['2'] || urls['1']);
+        });
+      });
+    }catch(e){ console.warn('FFZ global fehlgeschlagen', e); }
+    try{
+      const c = await (await fetch(`https://api.frankerfacez.com/v1/room/${CHANNEL}`)).json();
+      Object.values(c.sets||{}).forEach(set=>{
+        set.emoticons.forEach(e=>{
+          const urls = e.urls;
+          ffzEmotes[e.name] = 'https:' + (urls['2'] || urls['1']);
+        });
+      });
+    }catch(e){ console.warn('FFZ channel fehlgeschlagen (evtl. kein FFZ im Kanal)', e); }
+
+    // 7TV global + channel
+    try{
+      const g = await (await fetch('https://7tv.io/v3/emote-sets/global')).json();
+      (g.emotes||[]).forEach(e=>{
+        sevenTvEmotes[e.name] = `https://cdn.7tv.app/emote/${e.id}/2x.webp`;
+      });
+    }catch(e){ console.warn('7TV global fehlgeschlagen', e); }
+    if(twitchId){
+      try{
+        const c = await (await fetch(`https://7tv.io/v3/users/twitch/${twitchId}`)).json();
+        (c.emote_set?.emotes||[]).forEach(e=>{
+          sevenTvEmotes[e.name] = `https://cdn.7tv.app/emote/${e.id}/2x.webp`;
+        });
+      }catch(e){ console.warn('7TV channel fehlgeschlagen (evtl. kein 7TV im Kanal)', e); }
+    }
+
+    // Twitch-Badges (global + channel), nur falls SHOW_BADGES
+    if(SHOW_BADGES){
+      try{
+        const g = await (await fetch('https://badges.twitch.tv/v1/badges/global/display')).json();
+        Object.entries(g.badge_sets).forEach(([setId, val])=>{
+          Object.entries(val.versions).forEach(([ver, v])=>{
+            badgeCache[`${setId}/${ver}`] = v.image_url_2x;
+          });
+        });
+      }catch(e){ console.warn('Global Badges fehlgeschlagen', e); }
+      if(twitchId){
+        try{
+          const c = await (await fetch(`https://badges.twitch.tv/v1/badges/channels/${twitchId}/display`)).json();
+          Object.entries(c.badge_sets).forEach(([setId, val])=>{
+            Object.entries(val.versions).forEach(([ver, v])=>{
+              badgeCache[`${setId}/${ver}`] = v.image_url_2x;
+            });
+          });
+        }catch(e){ console.warn('Channel Badges fehlgeschlagen', e); }
+      }
+    }
+  } finally {
+    connectIRC();
+  }
+}
+
+/* ---------- Twitch IRC via WebSocket (anonym, nur lesen) ---------- */
+function connectIRC(){
+  setStatus('verbinde…');
+  const ws = new WebSocket('wss://irc-ws.chat.twitch.tv:443');
+  const anonNick = 'justinfan' + Math.floor(10000 + Math.random()*89999);
+
+  ws.onopen = () => {
+    ws.send('CAP REQ :twitch.tv/tags twitch.tv/commands');
+    ws.send(`PASS SCHMOOPIIE`);
+    ws.send(`NICK ${anonNick}`);
+    ws.send(`JOIN #${CHANNEL}`);
+    setStatus('#' + CHANNEL);
+  };
+
+  ws.onmessage = (ev) => {
+    ev.data.split('\r\n').forEach(line => {
+      if(!line) return;
+      if(line.startsWith('PING')){ ws.send('PONG :tmi.twitch.tv'); return; }
+      if(line.includes('PRIVMSG')) handlePrivmsg(line);
+    });
+  };
+
+  ws.onclose = () => { setStatus('getrennt – reconnect…'); setTimeout(connectIRC, 3000); };
+  ws.onerror = () => ws.close();
+}
+
+function parseTags(raw){
+  const tags = {};
+  raw.slice(1).split(';').forEach(kv=>{
+    const idx = kv.indexOf('=');
+    tags[kv.slice(0,idx)] = kv.slice(idx+1);
+  });
+  return tags;
+}
+
+function handlePrivmsg(line){
+  let tags = {};
+  let rest = line;
+  if(line.startsWith('@')){
+    const sp = line.indexOf(' ');
+    tags = parseTags(line.slice(0, sp));
+    rest = line.slice(sp+1);
+  }
+  const msgIdx = rest.indexOf(' PRIVMSG #');
+  if(msgIdx === -1) return;
+  const colonIdx = rest.indexOf(' :', msgIdx);
+  if(colonIdx === -1) return;
+  const text = rest.slice(colonIdx+2);
+
+  const displayName = tags['display-name'] || (rest.split('!')[0].slice(1));
+  const color = tags['color'] && tags['color'] !== '' ? tags['color'] : '#c0c0ff';
+  const badges = (tags['badges']||'').split(',').filter(Boolean);
+  const nativeEmotes = tags['emotes'] || '';
+
+  renderMessage({displayName, color, badges, text, nativeEmotes});
+}
+
+/* ---------- Rendering ---------- */
+function buildSegments(text, nativeEmotesTag){
+  // native Twitch-Emotes nach Zeichenposition ersetzen
+  const ranges = [];
+  if(nativeEmotesTag){
+    nativeEmotesTag.split('/').forEach(part=>{
+      const [id, positions] = part.split(':');
+      positions.split(',').forEach(pos=>{
+        const [start,end] = pos.split('-').map(Number);
+        ranges.push({start, end, id});
+      });
+    });
+  }
+  ranges.sort((a,b)=>a.start-b.start);
+
+  const chars = Array.from(text); // unicode-sicher
+  const segments = [];
+  let i = 0;
+  let ri = 0;
+  while(i < chars.length){
+    if(ri < ranges.length && ranges[ri].start === i){
+      const r = ranges[ri];
+      const word = chars.slice(r.start, r.end+1).join('');
+      segments.push({type:'emote', url:`https://static-cdn.jtvnw.net/emoticons/v2/${r.id}/default/dark/2.0`, alt:word});
+      i = r.end+1; ri++;
+    } else {
+      let j = i;
+      while(j < chars.length && !(ri < ranges.length && ranges[ri].start === j)) j++;
+      const chunk = chars.slice(i,j).join('');
+      segments.push({type:'text', value:chunk});
+      i = j;
+    }
+  }
+
+  // Textteile zusätzlich auf BTTV/FFZ/7TV prüfen (wortweise)
+  const finalSegs = [];
+  segments.forEach(seg=>{
+    if(seg.type !== 'text'){ finalSegs.push(seg); return; }
+    seg.value.split(/(\s+)/).forEach(tok=>{
+      if(!tok){ return; }
+      if(/^\s+$/.test(tok)){ finalSegs.push({type:'text', value:tok}); return; }
+      const url = bttvEmotes[tok] || ffzEmotes[tok] || sevenTvEmotes[tok];
+      if(url) finalSegs.push({type:'emote', url, alt:tok});
+      else finalSegs.push({type:'text', value:tok});
+    });
+  });
+  return finalSegs;
+}
+
+function renderMessage({displayName, color, badges, text, nativeEmotes}){
+  const div = document.createElement('div');
+  div.className = 'msg';
+
+  if(SHOW_BADGES){
+    badges.forEach(b=>{
+      const url = badgeCache[b];
+      if(url){
+        const img = document.createElement('img');
+        img.src = url; img.className = 'badge'; img.alt='';
+        div.appendChild(img);
+      }
+    });
+  }
+
+  const user = document.createElement('span');
+  user.className = 'user';
+  user.style.color = color;
+  user.textContent = displayName;
+  div.appendChild(user);
+
+  const colon = document.createElement('span');
+  colon.className = 'colon';
+  colon.textContent = ':';
+  div.appendChild(colon);
+
+  buildSegments(text, nativeEmotes).forEach(seg=>{
+    if(seg.type === 'emote'){
+      const img = document.createElement('img');
+      img.src = seg.url; img.alt = seg.alt; img.title = seg.alt;
+      img.className = 'emote';
+      div.appendChild(img);
+    } else {
+      const span = document.createElement('span');
+      span.className = 'word';
+      span.textContent = seg.value;
+      div.appendChild(span);
+    }
+  });
+
+  chatEl.appendChild(div);
+  while(chatEl.children.length > MAX_MESSAGES){
+    chatEl.removeChild(chatEl.firstChild);
+  }
+}
+
+loadEmotes();
+</script>
+</body>
+</html>
